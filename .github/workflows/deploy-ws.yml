@@ -1,0 +1,138 @@
+name: Deploy WebSocket Service
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'src/**'
+      - 'Dockerfile'
+      - 'docker-compose.yml'
+      - 'package.json'
+      - 'pnpm-lock.yaml'
+      - '.github/workflows/deploy-ws.yml'
+  workflow_dispatch:
+
+jobs:
+  deploy-ws:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy to VM
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SSH_PORT }}
+          timeout: 6h
+          command_timeout: 360m
+          script: |
+            set -e
+            
+            echo "🚀 Starting WebSocket service deployment..."
+            cd ~/oms-ws
+            
+            # Verify we're in the right repository
+            echo "📋 Current repository:"
+            git remote -v
+            
+            # Pull latest code from the repository
+            echo "📥 Pulling latest code..."
+            git pull origin main || git fetch origin main && git reset --hard origin/main
+            
+            # Create .env file with secrets from GitHub
+            echo "🔧 Setting up environment variables (.env)..."
+            cat > .env << EOF
+            NODE_ENV=production
+            WS_PORT=${{ secrets.WS_PORT || '8080' }}
+            OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY || secrets.GOOGLE_GENERATIVE_AI_API_KEY }}
+            OUTREACH_API_URL=${{ secrets.OUTREACH_API_URL }}
+            EOF
+            
+            # Stop existing backend-ws container gracefully
+            echo "🛑 Stopping existing backend-ws container..."
+            docker compose down backend-ws --timeout 30 || true
+            
+            # Force remove if needed
+            echo "🧹 Cleaning up any remaining containers..."
+            docker compose rm -f backend-ws || true
+            
+            # Wait a moment
+            sleep 3
+            
+            # Build and start only backend-ws service
+            echo "🔨 Building backend-ws container..."
+            docker compose build backend-ws
+            
+            echo "🚀 Starting backend-ws container..."
+            docker compose up -d backend-ws
+            
+            # Wait for service to be ready
+            echo "⏳ Waiting for WebSocket service to start..."
+            sleep 15
+            
+            # Health check (check if container is running)
+            echo "🏥 Performing health check..."
+            if docker compose ps backend-ws | grep -q "Up"; then
+              echo "✅ WebSocket service container is running!"
+            else
+              echo "❌ Health check failed - container not running"
+              echo "📋 Container status:"
+              docker compose ps backend-ws
+              echo "📋 Container logs:"
+              docker compose logs backend-ws --tail=50
+              exit 1
+            fi
+            
+            # Clean up unused images
+            echo "🧹 Cleaning up unused Docker images..."
+            docker image prune -f || true
+            
+            # Show deployment status
+            echo "📊 Deployment Status:"
+            docker compose ps backend-ws
+            
+            echo "✅ WebSocket service deployment successful!"
+            echo "📋 Repository: $(git config --get remote.origin.url)"
+            echo "📋 Latest commit: $(git log -1 --oneline)"
+
+      - name: Rollback on failure
+        if: failure()
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SSH_PORT }}
+          timeout: 6h
+          command_timeout: 360m
+          script: |
+            echo "🔄 Starting rollback process..."
+            cd ~/oms-ws
+            
+            # Get the previous commit
+            PREVIOUS_COMMIT=$(git log -2 --oneline | tail -1 | cut -d' ' -f1)
+            echo "🔄 Rolling back to commit: $PREVIOUS_COMMIT"
+            
+            # Reset to previous commit
+            git reset --hard $PREVIOUS_COMMIT
+            
+            # Rebuild and restart
+            docker compose build backend-ws --no-cache
+            docker compose up -d backend-ws
+            
+            # Wait and check health
+            sleep 15
+            if docker compose ps backend-ws | grep -q "Up"; then
+              echo "✅ Rollback successful!"
+            else
+              echo "❌ Rollback failed - manual intervention required"
+              exit 1
+            fi
+
+
