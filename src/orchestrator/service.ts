@@ -33,50 +33,71 @@ export class OrchestratorService {
     this.embeddingQueue = opts?.embeddingQueue;
   }
 
-  private readonly SYSTEM_PROMPT = `You are an AI assistant with access to backend tools.
+  private readonly SYSTEM_PROMPT = `You are an intelligent AI assistant with access to tools, user documents, and conversation history.
 
-## Your Process:
-1. Analyze the user's intent
-2. Decide if you need tools or can respond directly
-3. If tools are needed, call them with clear reasoning about your choice
-4. Interpret the results and provide a helpful summary
+## CRITICAL: Document Context Handling
+When document context is provided below (marked with "📄 RELEVANT DOCUMENT CONTEXT" or similar headers), you MUST:
+- **ALWAYS use the document context to answer questions** - it contains the actual content the user is asking about
+- **NEVER say you need the document** - you already have it in the context below
+- **Reference specific details** from the document context (numbers, names, sections, data points)
+- **Assume the user has already shared the document** when they say "this doc", "the document", "the file", etc.
+- Be confident and direct in your answers based on the provided context
 
-## Available Tools:
+When the user asks to "summarize this doc", "analyze this file", "what's in the document", etc., you should:
+1. Look for the document context section below (it will be clearly marked)
+2. Use that context to provide a comprehensive answer
+3. DO NOT ask for the document again - you already have it
+
+---
+
+## Available Tools
+You have access to these tools for specific tasks:
+
+**Publisher & Shopping Tools:**
 - browsePublishers: Search publishers for backlinking opportunities
-- viewCart: View the current shopping cart contents. Use this to show the user their cart.
-- addToCart: Add a publisher or product to the shopping cart. Use this when user wants to add items.
-- processPayment: Process payment for cart items. Use this when user is ready to checkout.
+- viewCart: View the current shopping cart contents
+- addToCart: Add a publisher or product to the shopping cart
+- processPayment: Process payment for cart items
 
-## Cart and Checkout Flow:
+**When to Use Tools:**
+- Use browsePublishers ONLY when user explicitly asks to find/search/browse publishers
+- Use cart tools ONLY when user explicitly wants to view/add items to cart or checkout
+- DO NOT use tools for document-related questions (summarize, analyze, explain documents)
+- DO NOT use tools for general conversation or questions about provided documents
+
+---
+
+## Cart and Checkout Flow
 1. After browsePublishers is called, proactively suggest adding publishers to cart
 2. When user mentions specific publishers or says "add these" or "add to cart", use addToCart for each selected publisher
 3. After items are added to cart, ALWAYS call viewCart to show the user their current cart
-4. When showing the cart, ask the user: "Would you like to edit anything in your cart, or are you ready to proceed to checkout?"
+4. When showing the cart, ask: "Would you like to edit anything in your cart, or are you ready to proceed to checkout?"
 5. If user says they're done or ready to checkout, call processPayment with the current cart items
 6. If user wants to edit the cart, wait for their changes and then show cart again
 
-## Rules:
-- For simple questions or greetings, respond directly without tools
-- For document-related tasks (e.g., "summarize this doc", "explain the document", or when user provided referenced documents), DO NOT call any tools. Use the referenced document context provided to you and respond directly.
-- Only use browsePublishers / cart tools when the user's intent is explicitly about finding, viewing, adding, or purchasing publishers/products.
-- Provide clear reasoning when choosing to use a tool
-- Keep responses conversational and helpful
-- After showing publishers, immediately suggest adding selected publishers to cart
-- When user mentions cart, always show the cart using viewCart
+---
 
-## Examples:
-User: "Hi"
-You: "Hello! How can I help you today?"
+## Response Style
+- **Be conversational and helpful**
+- **Be confident** - when you have document context or user information, use it directly without hesitation
+- **Use markdown for beautiful formatting:**
+  * Use **bold** for important terms and numbers
+  * Use bullet points with • or - for lists
+  * Use emojis strategically (✅ ❌ 🎯 📊 💰 🔍 etc.)
+  * Use line breaks for better readability
+  * Use > blockquotes for important notes or tips
+- **Never mention technical details** like "vector search", "API calls", "embeddings", "filters", etc.
+- **Focus on what the user gets**, not how you do it
 
-User: "Find publishers in tech"
-You: "Let me search for tech publishers for you. [reasoning about using browsePublishers tool]"
+---
 
-User: "Add TechCrunch to cart"
-You: "I'll add TechCrunch to your cart. [call addToCart] Now showing your cart... [call viewCart]"
+## Decision Logic
+1. **Is there document context below?** → Use it to answer document questions directly
+2. **Is this a simple greeting or question?** → Respond directly without tools
+3. **Is the user asking about publishers/shopping?** → Use appropriate tools
+4. **Is this about user preferences/history?** → Use the USER PERSONAL INFORMATION section if provided
 
-User: "Show my cart"
-You: "Let me show you your current cart. [call viewCart]"`;
-
+Remember: You are helpful, intelligent, and confident. When you have the information (in document context or user history), use it directly!`;
   async processMessage(
     chatId: string,
     userMessage: ChatMessage,
@@ -107,11 +128,13 @@ You: "Let me show you your current cart. [call viewCart]"`;
       this.chatHistory.addMessage(chatId, userMessage);
 
       // Debug: log selected document references if any
-      try {
-        if (Array.isArray(selectedDocuments)) {
-          console.log(`[DocRAG] SelectedDocuments received chatId=${chatId} count=${selectedDocuments.length} ids=${selectedDocuments.join(',')}`);
-        }
-      } catch {}
+      console.log(`[DocRAG] DEBUG: selectedDocuments parameter:`, {
+        exists: selectedDocuments !== undefined,
+        isArray: Array.isArray(selectedDocuments),
+        length: selectedDocuments?.length,
+        value: selectedDocuments,
+        chatId
+      });
 
       // After adding to history, enqueue embedding of the user message (non-blocking)
       try {
@@ -135,10 +158,104 @@ You: "Let me show you your current cart. [call viewCart]"`;
       // Build conversation with system prompt + history
       // Include cart context in system prompt if available
       let systemPrompt = this.SYSTEM_PROMPT;
+      
+      // Get userId early for document retrieval
+      const userId = (wsServer as any).getUserIdForChat?.(chatId) as string | undefined;
+
+      // Store document context separately (like mosaic-next does)
+      let documentContext = '';
+
+      // ===== DOCUMENT RETRIEVAL - Handle FIRST and independently =====
+      // This ensures documents are retrieved even if conversation RAG fails or is disabled
+      console.log(`[DocRAG] DEBUG: Checking conditions for document retrieval:`, {
+        hasSelectedDocuments: !!(selectedDocuments && selectedDocuments.length > 0),
+        selectedDocumentsLength: selectedDocuments?.length || 0,
+        hasUserId: !!userId,
+        userId: userId,
+        hasEmbedder: !!this.embedder,
+        hasPinecone: !!this.pinecone,
+        hasUserMessageContent: !!userMessage?.content,
+        userMessageContent: userMessage?.content?.substring(0, 50) || 'N/A'
+      });
+      
+      if (selectedDocuments && selectedDocuments.length > 0 && userId && this.embedder && this.pinecone && userMessage?.content) {
+        console.log(`[DocRAG] 🚀 Starting document retrieval for ${selectedDocuments.length} selected documents`);
+        console.log(`[DocRAG] Selected document IDs:`, selectedDocuments);
+        console.log(`[DocRAG] User ID: ${userId}, Namespace: user_${userId}_docs`);
+        
+        try {
+          // Generate embedding for document query
+          const { embedding: docEmbedding } = await this.embedder.embed(userMessage.content);
+          
+          if (docEmbedding && docEmbedding.length > 0) {
+            const { DocumentRetrievalService } = await import('../services/document-retrieval.js');
+            const docRetriever = new DocumentRetrievalService(this.pinecone!);
+            
+            console.log(`[DocRAG] Calling querySelectedDocuments with embedding length=${docEmbedding.length}`);
+            
+            const docMatches = await docRetriever.querySelectedDocuments({
+              userId,
+              queryEmbedding: docEmbedding,
+              selectedDocuments,
+              topKPerDoc: 10,
+              minScore: 0.15,
+            });
+            
+            console.log(`[DocRAG] Retrieved ${docMatches.length} document chunks from Pinecone`);
+
+            if (docMatches.length > 0) {
+              // Format document context similar to mosaic-next approach
+              documentContext = this.formatDocumentContextForAllTypes(docMatches, userMessage.content || '');
+              
+              console.log(`[DocRAG] ✅ SUCCESS: Prepared ${docMatches.length} chunks from ${selectedDocuments.length} selected documents`);
+              console.log('[DocRAG] Document context length:', documentContext.length, 'characters');
+              console.log('[DocRAG] Document context preview (first 1000 chars):\n', documentContext.slice(0, 1000));
+            } else {
+              console.log('[DocRAG] ⚠️ WARNING: No document chunks retrieved for selected documents');
+              console.log('[DocRAG] This could mean:');
+              console.log('[DocRAG]   1. Documents are not yet processed/embedded');
+              console.log('[DocRAG]   2. Document IDs do not match what is stored in Pinecone');
+              console.log('[DocRAG]   3. Query embedding does not match document embeddings');
+            }
+          } else {
+            console.log('[DocRAG] ⚠️ Failed to generate embedding for document query');
+          }
+        } catch (err) {
+          console.error('[DocRAG] ❌ ERROR: Document retrieval failed:', err);
+          console.error('[DocRAG] Error details:', err instanceof Error ? err.message : String(err));
+          console.error('[DocRAG] Stack:', err instanceof Error ? err.stack : 'N/A');
+        }
+      } else {
+        console.log('[DocRAG] ⚠️ Document retrieval SKIPPED - Conditions not met:');
+        if (!selectedDocuments || selectedDocuments.length === 0) {
+          console.log('[DocRAG]   ❌ No selected documents provided (selectedDocuments:', selectedDocuments, ')');
+        }
+        if (!userId) {
+          console.log('[DocRAG]   ❌ No userId available for document retrieval');
+        }
+        if (!this.embedder) {
+          console.log('[DocRAG]   ❌ Embedder not available for document retrieval');
+        }
+        if (!this.pinecone) {
+          console.log('[DocRAG]   ❌ Pinecone not available for document retrieval');
+        }
+        if (!userMessage?.content) {
+          console.log('[DocRAG]   ❌ No user message content for document retrieval');
+        }
+      }
+      
+      // Always log document context status
+      console.log(`[DocRAG] Document context status: ${documentContext ? `PREPARED (${documentContext.length} chars)` : 'NOT PREPARED'}`);
+      
+      // Insert document context into system prompt (like mosaic-next line 176)
+      // Insert it naturally - the AI will understand how to use it
+      if (documentContext) {
+        systemPrompt = systemPrompt + '\n\n' + documentContext;
+        console.log('[DocRAG] ✅ Document context inserted into system prompt');
+      }
 
       // Inject Personalization Context via RAG (non-blocking if services missing)
       try {
-        const userId = (wsServer as any).getUserIdForChat?.(chatId) as string | undefined;
         if (userId && this.embedder && this.pinecone && userMessage?.content) {
           const start = Date.now();
           console.log(`[RAG] Retrieval start chatId=${chatId} userId=${userId}`);
@@ -241,59 +358,6 @@ You: "Let me show you your current cart. [call viewCart]"`;
               
               systemPrompt += contextSection;
 
-              console.log('reached here', selectedDocuments);
-
-              // Document-context retrieval if user selected documents
-              if (selectedDocuments && selectedDocuments.length > 0) {
-                console.log('selectedDocuments', selectedDocuments);
-                console.log(`[DocRAG] Attempting document retrieval userId=${userId} namespace=user_${userId}_docs selected=${selectedDocuments.length}`);
-                try {
-                  const { DocumentRetrievalService } = await import('../services/document-retrieval.js');
-                  const docRetriever = new DocumentRetrievalService(this.pinecone!);
-                  const docMatches = await docRetriever.querySelectedDocuments({
-                    userId,
-                    queryEmbedding: embedding,
-                    selectedDocuments,
-                    topKPerDoc: 3,
-                    minScore: 0.3,
-                  });
-
-                  if (docMatches.length > 0) {
-                    const grouped: Record<string, { name?: string; chunks: { score: number; content: string }[] }> = {};
-                    for (const m of docMatches) {
-                      const entry = grouped[m.documentId] || { name: m.documentName, chunks: [] };
-                      entry.chunks.push({ score: m.score, content: m.content });
-                      grouped[m.documentId] = entry;
-                    }
-                    const docContext = Object.entries(grouped)
-                      .map(([docId, info]) => {
-                        const name = info.name ? ` (${info.name})` : '';
-                        const bullets = info.chunks
-                          .sort((a, b) => b.score - a.score)
-                          .slice(0, 5)
-                          .map(c => `- ${c.content}`)
-                          .join('\n');
-                        return `Document ${docId}${name}:\n${bullets}`;
-                      })
-                      .join('\n\n');
-
-                    const section = `## REFERENCED DOCUMENTS\nUse the following context from the user's selected documents if relevant:\n${docContext}\n`;
-                    // Insert the section before the Examples block so it shows up early in the prompt preview
-                    if (systemPrompt.includes('## Examples:')) {
-                      systemPrompt = systemPrompt.replace('## Examples:', `${section}\n## Examples:`);
-                    } else {
-                      systemPrompt = `${systemPrompt}\n\n${section}`;
-                    }
-                    console.log(`[DocRAG] Injected ${docMatches.length} chunks from ${selectedDocuments.length} selected documents`);
-                    console.log('[DocRAG] Section preview:\n', section.slice(0, 800));
-                  } else {
-                    console.log('[DocRAG] No matches for selected documents');
-                  }
-                } catch (err) {
-                  console.error('[DocRAG] Retrieval failed:', err);
-                }
-              }
-
               // Debug logging
               console.log(`[RAG] Context injected: profileFacts=${profileFacts.length} conversationContext=${conversationContext.length}`);
               if (profileFacts.length > 0) {
@@ -312,6 +376,7 @@ You: "Let me show you your current cart. [call viewCart]"`;
         // On any retrieval failure, proceed without personalization context
         console.error(`[RAG] Retrieval failed chatId=${chatId}`);
       }
+      
       if (cartData && cartData.items.length > 0) {
         systemPrompt += `\n\n## Current Cart Context:
 - Cart has ${cartData.totalItems} item${cartData.totalItems !== 1 ? 's' : ''} totaling $${cartData.totalPrice.toFixed(2)}
@@ -327,10 +392,27 @@ You: "Let me show you your current cart. [call viewCart]"`;
 
       // Debug: log final system prompt/context being sent to the model (truncated for safety)
       try {
-        const hasDocContext = systemPrompt.includes('## REFERENCED DOCUMENTS') || systemPrompt.includes('# Referenced Documents') || systemPrompt.includes('## USER PERSONAL INFORMATION');
-        const preview = systemPrompt.length > 2000 ? `${systemPrompt.slice(0, 2000)}…` : systemPrompt;
+        const hasDocContext = systemPrompt.includes('RELEVANT DOCUMENT CONTEXT') || 
+                              systemPrompt.includes('REFERENCED DOCUMENTS') || 
+                              systemPrompt.includes('📄 RELEVANT DOCUMENT CONTEXT') ||
+                              systemPrompt.includes('📊 CSV Data Analysis') ||
+                              systemPrompt.includes('📄 Word Document Analysis') ||
+                              systemPrompt.includes('📊 Excel Workbook Analysis') ||
+                              systemPrompt.includes('📄 PDF Document Analysis');
+        const preview = systemPrompt.length > 3000 ? `${systemPrompt.slice(0, 3000)}…` : systemPrompt;
         console.log('[AI] Final system prompt length=', systemPrompt.length, 'hasDocContext=', hasDocContext);
-        console.log('[AI] Final system prompt preview:\n', preview);
+        
+        // Find document context section in prompt for better debugging
+        const docContextIndex = systemPrompt.indexOf('RELEVANT DOCUMENT CONTEXT');
+        if (docContextIndex !== -1) {
+          const docContextSection = systemPrompt.slice(docContextIndex, Math.min(docContextIndex + 1000, systemPrompt.length));
+          console.log('[AI] Document context found in prompt at index', docContextIndex);
+          console.log('[AI] Document context preview:\n', docContextSection.slice(0, 500));
+        } else {
+          console.log('[AI] WARNING: Document context NOT found in final system prompt!');
+        }
+        
+        console.log('[AI] Final system prompt preview (first 2000 chars):\n', preview);
       } catch {}
 
       // STEP 1: Analyze intent and decide on tool usage
@@ -862,6 +944,184 @@ You: "Let me show you your current cart. [call viewCart]"`;
       timestamp: Date.now(),
       message_id: `stream_end_${Date.now()}`
     });
+  }
+
+  /**
+   * Format document context for all document types (CSV, XLSX, DOCX, PDF, etc.)
+   * Similar to mosaic-next formatDocumentContextForAllTypes function
+   */
+  private formatDocumentContextForAllTypes(
+    chunks: Array<{
+      documentId: string;
+      documentName?: string;
+      content: string;
+      score: number;
+      chunkIndex?: number;
+      metadata?: any;
+    }>,
+    userMessage: string
+  ): string {
+    // Separate chunks by type
+    const csvChunks = chunks.filter(chunk => 
+      chunk.metadata?.chunkType?.startsWith('csv_') || 
+      chunk.metadata?.isCSV
+    );
+    const xlsxChunks = chunks.filter(chunk => 
+      chunk.metadata?.chunkType?.startsWith('xlsx_') || 
+      chunk.metadata?.isXLSX
+    );
+    const docxChunks = chunks.filter(chunk => 
+      chunk.metadata?.chunkType?.startsWith('docx_') || 
+      chunk.metadata?.isDOCX
+    );
+    const pdfChunks = chunks.filter(chunk => 
+      chunk.metadata?.chunkType?.startsWith('pdf_') || 
+      chunk.metadata?.isPDF
+    );
+    const otherChunks = chunks.filter(chunk => 
+      !chunk.metadata?.chunkType?.startsWith('csv_') && 
+      !chunk.metadata?.chunkType?.startsWith('xlsx_') &&
+      !chunk.metadata?.chunkType?.startsWith('docx_') &&
+      !chunk.metadata?.chunkType?.startsWith('pdf_') &&
+      !chunk.metadata?.isCSV &&
+      !chunk.metadata?.isXLSX &&
+      !chunk.metadata?.isDOCX &&
+      !chunk.metadata?.isPDF
+    );
+
+    let context = '**📄 RELEVANT DOCUMENT CONTEXT:**\n\n';
+
+    // DOCX-specific context with priority ordering
+    if (docxChunks.length > 0) {
+      context += '**📄 Word Document Analysis:**\n';
+      const priorityOrder: Record<string, number> = { 'high': 0, 'medium': 1, 'low': 2 };
+      docxChunks.sort((a, b) => {
+        const aPriority = priorityOrder[a.metadata?.priority] ?? 2;
+        const bPriority = priorityOrder[b.metadata?.priority] ?? 2;
+        return aPriority - bPriority;
+      });
+
+      docxChunks.forEach((chunk) => {
+        const chunkType = chunk.metadata?.chunkType;
+        const relevance = (chunk.score * 100).toFixed(0);
+        const docName = chunk.documentName || 'Unknown Document';
+
+        if (chunkType === 'docx_summary') {
+          context += `[Document Summary - ${docName}] (Relevance: ${relevance}%)\n${chunk.content}\n\n`;
+        } else if (chunkType === 'docx_outline') {
+          context += `[Document Outline - ${docName}] (Relevance: ${relevance}%)\n${chunk.content}\n\n`;
+        } else if (chunkType === 'docx_paragraph') {
+          const range = chunk.metadata?.paragraphRange ? ` ${chunk.metadata.paragraphRange}` : '';
+          context += `[Paragraphs${range} - ${docName}] (Relevance: ${relevance}%)\n${chunk.content}\n\n`;
+        } else {
+          context += `[${docName} - Section ${(chunk.chunkIndex || 0) + 1}] (Relevance: ${relevance}%)\n${chunk.content}\n\n`;
+        }
+      });
+    }
+
+    // XLSX-specific context with priority ordering
+    if (xlsxChunks.length > 0) {
+      context += '**📊 Excel Workbook Analysis:**\n';
+      const priorityOrder: Record<string, number> = { 'high': 0, 'medium': 1, 'low': 2 };
+      xlsxChunks.sort((a, b) => {
+        const aPriority = priorityOrder[a.metadata?.priority] ?? 2;
+        const bPriority = priorityOrder[b.metadata?.priority] ?? 2;
+        return aPriority - bPriority;
+      });
+
+      xlsxChunks.forEach((chunk) => {
+        const chunkType = chunk.metadata?.chunkType;
+        const relevance = (chunk.score * 100).toFixed(0);
+        const docName = chunk.documentName || 'Unknown Document';
+
+        if (chunkType === 'xlsx_summary') {
+          context += `[Workbook Summary - ${docName}] (Relevance: ${relevance}%)\n${chunk.content}\n\n`;
+        } else if (chunkType === 'xlsx_sheet_overview') {
+          const sheetName = chunk.metadata?.sheetName ? `Sheet: ${chunk.metadata.sheetName} - ` : '';
+          context += `[${sheetName}${docName}] (Relevance: ${relevance}%)\n${chunk.content}\n\n`;
+        } else if (chunkType === 'xlsx_column') {
+          const columnName = chunk.metadata?.columnName || 'Unknown Column';
+          const sheetName = chunk.metadata?.sheetName ? ` - Sheet: ${chunk.metadata.sheetName}` : '';
+          context += `[Column: ${columnName}${sheetName} - ${docName}] (Relevance: ${relevance}%)\n${chunk.content}\n\n`;
+        } else {
+          context += `[${docName} - Section ${(chunk.chunkIndex || 0) + 1}] (Relevance: ${relevance}%)\n${chunk.content}\n\n`;
+        }
+      });
+    }
+
+    // CSV-specific context with priority ordering
+    if (csvChunks.length > 0) {
+      context += '**📊 CSV Data Analysis:**\n';
+      const priorityOrder: Record<string, number> = { 'high': 0, 'medium': 1, 'low': 2 };
+      csvChunks.sort((a, b) => {
+        const aPriority = priorityOrder[a.metadata?.priority] ?? 2;
+        const bPriority = priorityOrder[b.metadata?.priority] ?? 2;
+        return aPriority - bPriority;
+      });
+
+      csvChunks.forEach((chunk) => {
+        const chunkType = chunk.metadata?.chunkType;
+        const relevance = (chunk.score * 100).toFixed(0);
+        const docName = chunk.documentName || 'Unknown Document';
+
+        if (chunkType === 'csv_summary') {
+          context += `[Summary - ${docName}] (Relevance: ${relevance}%)\n${chunk.content}\n\n`;
+        } else if (chunkType === 'csv_statistics') {
+          context += `[Statistical Analysis - ${docName}] (Relevance: ${relevance}%)\n${chunk.content}\n\n`;
+        } else if (chunkType === 'csv_column') {
+          const columnName = chunk.metadata?.columnName || 'Unknown Column';
+          const columnType = chunk.metadata?.columnType ? ` (${chunk.metadata.columnType})` : '';
+          context += `[Column: ${columnName}${columnType} - ${docName}] (Relevance: ${relevance}%)\n${chunk.content}\n\n`;
+        } else if (chunkType === 'csv_rows') {
+          const rowRange = chunk.metadata?.rowRange ? ` ${chunk.metadata.rowRange}` : '';
+          context += `[Rows${rowRange} - ${docName}] (Relevance: ${relevance}%)\n${chunk.content}\n\n`;
+        } else {
+          context += `[${docName} - Section ${(chunk.chunkIndex || 0) + 1}] (Relevance: ${relevance}%)\n${chunk.content}\n\n`;
+        }
+      });
+    }
+
+    // PDF-specific context with priority ordering
+    if (pdfChunks.length > 0) {
+      context += '**📄 PDF Document Analysis:**\n';
+      const priorityOrder: Record<string, number> = { 'high': 0, 'medium': 1, 'low': 2 };
+      pdfChunks.sort((a, b) => {
+        const aPriority = priorityOrder[a.metadata?.priority] ?? 2;
+        const bPriority = priorityOrder[b.metadata?.priority] ?? 2;
+        return aPriority - bPriority;
+      });
+
+      pdfChunks.forEach((chunk) => {
+        const chunkType = chunk.metadata?.chunkType;
+        const relevance = (chunk.score * 100).toFixed(0);
+        const docName = chunk.documentName || 'Unknown Document';
+
+        if (chunkType === 'pdf_summary') {
+          context += `[Document Summary - ${docName}] (Relevance: ${relevance}%)\n${chunk.content}\n\n`;
+        } else if (chunkType === 'pdf_outline') {
+          context += `[Document Outline - ${docName}] (Relevance: ${relevance}%)\n${chunk.content}\n\n`;
+        } else if (chunkType === 'pdf_page') {
+          const pageNumber = chunk.metadata?.pageNumber || 'Unknown';
+          context += `[Page ${pageNumber} - ${docName}] (Relevance: ${relevance}%)\n${chunk.content}\n\n`;
+        } else {
+          context += `[${docName} - Section ${(chunk.chunkIndex || 0) + 1}] (Relevance: ${relevance}%)\n${chunk.content}\n\n`;
+        }
+      });
+    }
+
+    // Other document context
+    if (otherChunks.length > 0) {
+      context += '**📄 Other Document Content:**\n';
+      otherChunks.forEach((chunk) => {
+        const relevance = (chunk.score * 100).toFixed(0);
+        const docName = chunk.documentName || 'Unknown Document';
+        context += `[${docName} - Section ${(chunk.chunkIndex || 0) + 1}] (Relevance: ${relevance}%)\n${chunk.content}\n\n`;
+      });
+    }
+
+    context += '\n\n**Instructions:** Use this document context to provide accurate, data-driven responses. Reference specific values, columns, rows, sheets, sections, tables, lists, and pages when relevant. For Excel workbooks, prioritize workbook summaries and sheet overviews for general questions, and specific columns/statistics for detailed analysis. For Word documents, prioritize document summaries and outlines for general questions, and specific sections/tables for detailed analysis. For PDF documents, prioritize document summaries and outlines for general questions, and specific sections/tables/pages for detailed analysis. For CSV files, prioritize summaries and statistics for general questions, and specific columns/rows for detailed analysis.';
+
+    return context;
   }
 }
 
